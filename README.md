@@ -25,10 +25,10 @@ This project turns an **ESP32-H2** into a bidirectional **Zigbee IR Blaster** us
 
 | Component | Pin Name | ESP32-H2 Pin | Notes |
 | :--- | :--- | :--- | :--- |
-| **IR Receiver (VS1838B)** | Signal | **GPIO 10** | |
+| **IR Receiver (VS1838B)** | Signal | **GPIO 11** | |
 | | VCC | 3.3V | |
 | | GND | GND | |
-| **IR Transmitter** | Control | **GPIO 11** | Connect to Transistor Base via 1kΩ Resistor |
+| **IR Transmitter** | Control | **GPIO 10** | Connect to Transistor Base via 1kΩ Resistor |
 | **Button** | Boot | **GPIO 9** | Built-in BOOT button on most DevKits |
 
 #### Transistor Circuit for IR LED

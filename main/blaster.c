@@ -2,6 +2,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include "esp_log.h"
 #include "driver/gpio.h"
 #include "driver/rmt_tx.h"
@@ -15,10 +16,11 @@
 #include "zcl/esp_zigbee_zcl_on_off.h"
 #include "zcl/esp_zigbee_zcl_common.h"
 #include "nwk/esp_zigbee_nwk.h"
+#include "freertos/semphr.h"
 
 // Hardware Config
-#define IR_RX_GPIO              GPIO_NUM_10
-#define IR_TX_GPIO              GPIO_NUM_11
+#define IR_TX_GPIO              GPIO_NUM_10
+#define IR_RX_GPIO              GPIO_NUM_11
 #define BOOT_BUTTON_PIN         GPIO_NUM_9
 #define BUTTON_HOLD_TIME_MS     3000
 
@@ -45,6 +47,11 @@ static rmt_encoder_handle_t copy_encoder = NULL;
 
 // Buffer for IR Data Attribute
 static char ir_data_buffer[256] = {0};
+static bool g_learning_mode = false;
+
+
+static char g_latest_ir_cmd[256] = {0};
+static SemaphoreHandle_t g_cmd_mutex = NULL;
 
 // --- IR RMT Functions ---
 
@@ -53,10 +60,11 @@ static void init_ir_tx() {
     rmt_tx_channel_config_t tx_chan_config = {
         .clk_src = RMT_CLK_SRC_DEFAULT,
         .gpio_num = IR_TX_GPIO,
-        .mem_block_symbols = 64,
+        .mem_block_symbols = 64, // Reverted to 64
         .resolution_hz = RMT_RESOLUTION_HZ,
         .trans_queue_depth = 4,
     };
+    ESP_LOGI(TAG, "Configuring RMT TX Channel...");
     ESP_ERROR_CHECK(rmt_new_tx_channel(&tx_chan_config, &tx_channel));
 
     rmt_carrier_config_t carrier_config = {
@@ -76,70 +84,70 @@ static void init_ir_rx() {
     rmt_rx_channel_config_t rx_chan_config = {
         .clk_src = RMT_CLK_SRC_DEFAULT,
         .gpio_num = IR_RX_GPIO,
-        .mem_block_symbols = 64,
+        .mem_block_symbols = 64, // Reverted to 64
         .resolution_hz = RMT_RESOLUTION_HZ,
     };
+    ESP_LOGI(TAG, "Configuring RMT RX Channel...");
     ESP_ERROR_CHECK(rmt_new_rx_channel(&rx_chan_config, &rx_channel));
 
     ESP_ERROR_CHECK(rmt_enable(rx_channel));
 }
 
-// RMT Item Helper
-// Casting to specific struct to avoid union issues with different IDF versions
-typedef struct {
-    uint32_t duration : 15;
-    uint32_t level : 1;
-    uint32_t : 16;
-} rmt_item_legacy_t;
-
-// ...
-
 // Simple RLE parsing: "100,-100,200,-200" -> RMT symbols
 static esp_err_t transmit_ir_string(const char* data) {
-    if (!data || strlen(data) == 0) return ESP_FAIL;
-
-    // Estimate count
-    int count = 1;
-    for(const char* p = data; *p; p++) {
-        if(*p == ',') count++;
+    if (!data || data[0] == '\0') {
+        return ESP_FAIL;
     }
 
-    rmt_symbol_word_t* items = malloc(sizeof(rmt_symbol_word_t) * count);
-    if (!items) return ESP_ERR_NO_MEM;
-    
-    // Treat as legacy items for easy access
-    rmt_item_legacy_t* legacy_items = (rmt_item_legacy_t*)items;
+    // Parse tokens into a temporary int buffer
+    int32_t durations[256] = {0};
+    int token_count = 0;
 
-    char* datacpy = strdup(data);
-    char* token = strtok(datacpy, ",");
-    int i = 0;
-    
-    while(token && i < count) {
-        int val = atoi(token);
-        if (val > 0) {
-            // Mark (Pulse)
-            legacy_items[i].duration = val;
-            legacy_items[i].level = 1; 
-        } else {
-            // Space (Gap)
-            legacy_items[i].duration = -val; // Make positive for duration
-            legacy_items[i].level = 0;
-        }
-        token = strtok(NULL, ",");
-        i++;
+    char *datacpy = strdup(data);
+    if (!datacpy) {
+        return ESP_ERR_NO_MEM;
     }
-    
+    char *saveptr = NULL;
+    char *token = strtok_r(datacpy, ",", &saveptr);
+    while (token && token_count < (int)(sizeof(durations) / sizeof(durations[0]))) {
+        durations[token_count++] = (int32_t)strtol(token, NULL, 10);
+        token = strtok_r(NULL, ",", &saveptr);
+    }
     free(datacpy);
+
+    if (token_count == 0) {
+        return ESP_FAIL;
+    }
+
+    // Pair tokens into RMT symbols (two durations per symbol)
+    size_t symbol_count = (token_count + 1) / 2; // round up
+    rmt_symbol_word_t *items = calloc(symbol_count, sizeof(rmt_symbol_word_t));
+    if (!items) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    for (size_t i = 0; i < symbol_count; i++) {
+        int32_t first = durations[i * 2];
+        int32_t second = (i * 2 + 1 < token_count) ? durations[i * 2 + 1] : 0;
+
+        items[i].level0 = (first >= 0) ? 1 : 0;
+        items[i].duration0 = (uint32_t)abs(first);
+        items[i].level1 = (second >= 0) ? 1 : 0;
+        items[i].duration1 = (uint32_t)abs(second);
+    }
 
     rmt_transmit_config_t transmit_config = {
         .loop_count = 0,
     };
-    
-    ESP_LOGI(TAG, "Transmitting IR (%d symbols)...", i);
-    ESP_ERROR_CHECK(rmt_transmit(tx_channel, copy_encoder, items, i * sizeof(rmt_symbol_word_t), &transmit_config));
-    
+
+    ESP_LOGI(TAG, "Transmitting IR (%d symbols)...", (int)symbol_count);
+    esp_err_t err = rmt_transmit(tx_channel, copy_encoder, items, symbol_count * sizeof(rmt_symbol_word_t), &transmit_config);
+    if (err == ESP_OK) {
+        err = rmt_tx_wait_all_done(tx_channel, -1);
+    }
+
     free(items);
-    return ESP_OK;
+    return err;
 }
 
 static QueueHandle_t rx_queue = NULL;
@@ -159,10 +167,11 @@ static void real_ir_rx_task(void *pvParameters) {
     rmt_rx_register_event_callbacks(rx_channel, &cbs, NULL);
     
     rmt_symbol_word_t *buffer = malloc(RMT_RX_BUFFER_SIZE * sizeof(rmt_symbol_word_t));
-    rmt_item_legacy_t *legacy_buffer = (rmt_item_legacy_t*)buffer;
     
+    // Accept a wide but sane pulse range for IR (0.4us - 12ms)
     rmt_receive_config_t rx_config = {
-        .signal_range_min_ns = 1250,
+        .signal_range_min_ns = 400,
+        .signal_range_max_ns = 12000000,
     };
 
     while(1) {
@@ -179,17 +188,42 @@ static void real_ir_rx_task(void *pvParameters) {
             local_buffer[0] = '\0';
             
             for(size_t i=0; i<event_data.num_symbols; i++) {
-                // Limit buffer size
-                if (len >= sizeof(local_buffer) - 20) break; 
-                
-                int val = legacy_buffer[i].duration;
-                if (legacy_buffer[i].level == 0) val = -val; // Space
-                
-                int written = snprintf(local_buffer + len, sizeof(local_buffer) - len, "%s%d", (i==0?"":","), val);
-                if (written > 0) len += written;
+                // Each RMT symbol holds two durations; flatten both
+                int vals[2];
+                vals[0] = buffer[i].level0 ? buffer[i].duration0 : -((int)buffer[i].duration0);
+                vals[1] = buffer[i].level1 ? buffer[i].duration1 : -((int)buffer[i].duration1);
+
+                for (int j = 0; j < 2; j++) {
+                    if (vals[j] == 0) {
+                        continue; // skip trailing zeros
+                    }
+                    if (len >= (int)sizeof(local_buffer) - 20) {
+                        break;
+                    }
+                    int written = snprintf(local_buffer + len, sizeof(local_buffer) - len, "%s%d", (len == 0 ? "" : ","), vals[j]);
+                    if (written > 0) len += written;
+                }
             }
             
-            ESP_LOGI(TAG, "Encoded IR: %s", local_buffer);
+        if (len == 0) {
+            // Log first symbol to help debug why we got an empty capture
+            rmt_symbol_word_t *sym = buffer;
+            ESP_LOGW(TAG, "IR capture was empty, ignoring (symbols=%d, first={%u/%u,%u/%u})",
+                     event_data.num_symbols,
+                     sym->level0, sym->duration0,
+                     sym->level1, sym->duration1);
+            continue; // do not clobber the last learned command with noise
+        }
+
+            ESP_LOGI(TAG, "\n\n*** LEARNED COMMAND ***\n%s\n***********************\n", local_buffer);
+
+            if (g_cmd_mutex) {
+                xSemaphoreTake(g_cmd_mutex, portMAX_DELAY);
+                // Safe copy ensuring null termination
+                strncpy(g_latest_ir_cmd, local_buffer, sizeof(g_latest_ir_cmd) - 1);
+                g_latest_ir_cmd[sizeof(g_latest_ir_cmd) - 1] = '\0';
+                xSemaphoreGive(g_cmd_mutex);
+            }
 
             // Update Zigbee Attribute
             esp_zb_lock_acquire(portMAX_DELAY);
@@ -366,16 +400,82 @@ static void reset_button_task(void *pvParameters) {
     while (1) {
         if (gpio_get_level(BOOT_BUTTON_PIN) == 0) {
             int hold_count = 0;
+            bool reset_triggered = false;
             while (gpio_get_level(BOOT_BUTTON_PIN) == 0) {
                 vTaskDelay(pdMS_TO_TICKS(100));
                 hold_count += 100;
                 if (hold_count >= BUTTON_HOLD_TIME_MS) {
                     ESP_LOGW(TAG, "Factory Reset...");
                     esp_zb_factory_reset(); 
+                    reset_triggered = true;
+                    break;
+                }
+            }
+            
+            // Short press detected
+            if (!reset_triggered && hold_count > 50) { // Debounce
+                g_learning_mode = !g_learning_mode;
+                if (g_learning_mode) {
+                    ESP_LOGI(TAG, "Learning Mode: ENABLED");
+                } else {
+                    ESP_LOGI(TAG, "Learning Mode: DISABLED");
                 }
             }
         }
         vTaskDelay(pdMS_TO_TICKS(100)); 
+    }
+}
+
+static void ir_test_task(void *arg) {
+    // Default fallback pulse (Keep this for before any command is learned)
+    rmt_symbol_word_t default_items[2] = {0};
+    default_items[0].level0 = 1; default_items[0].duration0 = 500;
+    default_items[0].level1 = 0; default_items[0].duration1 = 500;
+    default_items[1].level0 = 1; default_items[1].duration0 = 500;
+    default_items[1].level1 = 0; default_items[1].duration1 = 0; // trailing mark
+
+    rmt_transmit_config_t default_cfg = { .loop_count = 0 };
+
+    char cmd_to_send[256];
+
+    while (1) {
+        bool has_learned = false;
+        cmd_to_send[0] = '\0';
+
+        // Prefer locally learned command
+        if (g_cmd_mutex) {
+            xSemaphoreTake(g_cmd_mutex, portMAX_DELAY);
+            if (strlen(g_latest_ir_cmd) > 0) {
+                strncpy(cmd_to_send, g_latest_ir_cmd, sizeof(cmd_to_send) - 1);
+                cmd_to_send[sizeof(cmd_to_send) - 1] = '\0';
+                has_learned = true;
+            }
+            xSemaphoreGive(g_cmd_mutex);
+        }
+
+        // Fallback to last Zigbee-written command (ir_data_buffer)
+        if (!has_learned) {
+            esp_zb_lock_acquire(portMAX_DELAY);
+            uint8_t zb_len = ir_data_buffer[0];
+            if (zb_len > 0) {
+                size_t copy_len = (zb_len < sizeof(cmd_to_send) - 1) ? zb_len : (sizeof(cmd_to_send) - 1);
+                memcpy(cmd_to_send, ir_data_buffer + 1, copy_len);
+                cmd_to_send[copy_len] = '\0';
+                has_learned = true;
+            }
+            esp_zb_lock_release();
+        }
+
+        if (has_learned) {
+            ESP_LOGI(TAG, "Test Task: Replaying learned command");
+            transmit_ir_string(cmd_to_send);
+        } else {
+            ESP_LOGI(TAG, "Test Task: No learned command yet, sending default pulse");
+            rmt_transmit(tx_channel, copy_encoder, default_items, sizeof(default_items), &default_cfg);
+            rmt_tx_wait_all_done(tx_channel, -1); // Good practice to wait here too
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(5000)); // Run once every 5 seconds
     }
 }
 
@@ -386,6 +486,12 @@ void app_main(void) {
     };
     ESP_ERROR_CHECK(esp_zb_platform_config(&config));
 
+    g_cmd_mutex = xSemaphoreCreateMutex();
+    if (g_cmd_mutex == NULL) {
+        ESP_LOGE(TAG, "Failed to create Mutex!");
+        return;
+    }
+
     // Init IR
     init_ir_tx();
     init_ir_rx();
@@ -394,4 +500,5 @@ void app_main(void) {
     xTaskCreate(reset_button_task, "reset_button", 2048, NULL, 10, NULL);
     xTaskCreate(real_ir_rx_task, "ir_rx", 4096, NULL, 10, NULL);
     xTaskCreate(esp_zb_task, "Zigbee_main", 4096, NULL, 5, NULL);
+    xTaskCreate(ir_test_task, "ir_test", 4096, NULL, 10, NULL);
 }
