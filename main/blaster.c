@@ -35,7 +35,6 @@
 #define ESP_MODEL_IDENTIFIER    "IR Blaster"
 
 // Custom Attribute for IR Data (String)
-// Using a custom attribute ID in the On/Off Cluster
 #define ESP_ZB_ZCL_ATTR_IR_DATA_ID 0xFF00
 
 static const char *TAG = "IR_BLASTER";
@@ -49,9 +48,12 @@ static rmt_encoder_handle_t copy_encoder = NULL;
 static char ir_data_buffer[256] = {0};
 static bool g_learning_mode = false;
 
-
 static char g_latest_ir_cmd[256] = {0};
+
+// Synchronization & Thread Safety
 static SemaphoreHandle_t g_cmd_mutex = NULL;
+static SemaphoreHandle_t g_tx_mutex = NULL;       // Protects RMT TX driver
+static SemaphoreHandle_t g_ir_learned_sem = NULL; // Signals when 1st command is learned
 
 // --- IR RMT Functions ---
 
@@ -60,7 +62,7 @@ static void init_ir_tx() {
     rmt_tx_channel_config_t tx_chan_config = {
         .clk_src = RMT_CLK_SRC_DEFAULT,
         .gpio_num = IR_TX_GPIO,
-        .mem_block_symbols = 64, // Reverted to 64
+        .mem_block_symbols = 64,
         .resolution_hz = RMT_RESOLUTION_HZ,
         .trans_queue_depth = 4,
     };
@@ -84,7 +86,7 @@ static void init_ir_rx() {
     rmt_rx_channel_config_t rx_chan_config = {
         .clk_src = RMT_CLK_SRC_DEFAULT,
         .gpio_num = IR_RX_GPIO,
-        .mem_block_symbols = 64, // Reverted to 64
+        .mem_block_symbols = 64,
         .resolution_hz = RMT_RESOLUTION_HZ,
     };
     ESP_LOGI(TAG, "Configuring RMT RX Channel...");
@@ -140,11 +142,18 @@ static esp_err_t transmit_ir_string(const char* data) {
         .loop_count = 0,
     };
 
+    esp_err_t err = ESP_OK;
+
+    // Mutex to prevent concurrent transmissions crashing the RMT driver
+    if (g_tx_mutex) xSemaphoreTake(g_tx_mutex, portMAX_DELAY);
+
     ESP_LOGI(TAG, "Transmitting IR (%d symbols)...", (int)symbol_count);
-    esp_err_t err = rmt_transmit(tx_channel, copy_encoder, items, symbol_count * sizeof(rmt_symbol_word_t), &transmit_config);
+    err = rmt_transmit(tx_channel, copy_encoder, items, symbol_count * sizeof(rmt_symbol_word_t), &transmit_config);
     if (err == ESP_OK) {
         err = rmt_tx_wait_all_done(tx_channel, -1);
     }
+
+    if (g_tx_mutex) xSemaphoreGive(g_tx_mutex);
 
     free(items);
     return err;
@@ -190,36 +199,28 @@ static void real_ir_rx_task(void *pvParameters) {
             for(size_t i=0; i<event_data.num_symbols; i++) {
                 // Each RMT symbol holds two durations; flatten both
                 int vals[2];
-                vals[0] = buffer[i].level0 ? buffer[i].duration0 : -((int)buffer[i].duration0);
-                vals[1] = buffer[i].level1 ? buffer[i].duration1 : -((int)buffer[i].duration1);
+                vals[0] = (buffer[i].level0 == 0) ? (int)buffer[i].duration0 : -((int)buffer[i].duration0);
+                vals[1] = (buffer[i].level1 == 0) ? (int)buffer[i].duration1 : -((int)buffer[i].duration1);
 
                 for (int j = 0; j < 2; j++) {
-                    if (vals[j] == 0) {
-                        continue; // skip trailing zeros
-                    }
-                    if (len >= (int)sizeof(local_buffer) - 20) {
-                        break;
-                    }
+                    if (vals[j] == 0) continue; 
+                    if (len >= (int)sizeof(local_buffer) - 20) break;
+                    
                     int written = snprintf(local_buffer + len, sizeof(local_buffer) - len, "%s%d", (len == 0 ? "" : ","), vals[j]);
                     if (written > 0) len += written;
                 }
             }
             
-        if (len == 0) {
-            // Log first symbol to help debug why we got an empty capture
-            rmt_symbol_word_t *sym = buffer;
-            ESP_LOGW(TAG, "IR capture was empty, ignoring (symbols=%d, first={%u/%u,%u/%u})",
-                     event_data.num_symbols,
-                     sym->level0, sym->duration0,
-                     sym->level1, sym->duration1);
-            continue; // do not clobber the last learned command with noise
-        }
+            if (len == 0) {
+                rmt_symbol_word_t *sym = buffer;
+                ESP_LOGW(TAG, "IR capture was empty, ignoring (symbols=%d)", event_data.num_symbols);
+                continue; // Wait for a valid signal
+            }
 
             ESP_LOGI(TAG, "\n\n*** LEARNED COMMAND ***\n%s\n***********************\n", local_buffer);
 
             if (g_cmd_mutex) {
                 xSemaphoreTake(g_cmd_mutex, portMAX_DELAY);
-                // Safe copy ensuring null termination
                 strncpy(g_latest_ir_cmd, local_buffer, sizeof(g_latest_ir_cmd) - 1);
                 g_latest_ir_cmd[sizeof(g_latest_ir_cmd) - 1] = '\0';
                 xSemaphoreGive(g_cmd_mutex);
@@ -236,6 +237,18 @@ static void real_ir_rx_task(void *pvParameters) {
                 false
             );
             esp_zb_lock_release();
+
+            // Notify the TX task that a command is learned
+            if (g_ir_learned_sem) {
+                xSemaphoreGive(g_ir_learned_sem);
+            }
+
+            // Shut down RX to prevent it from running alongside TX
+            ESP_LOGI(TAG, "First IR command learned. Stopping RX and exiting listen task.");
+            rmt_disable(rx_channel);
+            free(buffer);
+            vQueueDelete(rx_queue);
+            vTaskDelete(NULL); // Terminate this task completely
         }
     }
 }
@@ -250,19 +263,14 @@ static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t 
         
         ESP_LOGI(TAG, "IR Data Attribute Written!");
         
-        // info type fix: message->info is esp_zb_device_cb_common_info_t
-        // But for set_attr_value, it might be different?
-        // Let's just access message->info directly.
-        
         uint8_t *zcl_string = (uint8_t*)message->attribute.data.value;
         if (zcl_string) {
             uint8_t len = ir_data_buffer[0];
-            // Removed always-true check if buffer size > 255
             if (len > 0) {
                 char temp[256];
                 memcpy(temp, ir_data_buffer + 1, len);
                 temp[len] = '\0';
-                ESP_LOGI(TAG, "Transmitting: %s", temp);
+                ESP_LOGI(TAG, "Transmitting via Zigbee Trigger: %s", temp);
                 transmit_ir_string(temp);
             }
         }
@@ -338,8 +346,6 @@ static void esp_zb_task(void *pvParameters) {
     bool on_off_value = false;
     esp_zb_on_off_cluster_add_attr(on_off_attr_list, ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID, &on_off_value);
     
-    // Custom Attribute: IR Data (Char String)
-    // Value is pointer to our buffer. Buffer first byte = Length.
     // Initialize buffer with length 0
     ir_data_buffer[0] = 0; 
     
@@ -373,7 +379,7 @@ static void esp_zb_task(void *pvParameters) {
     esp_zb_endpoint_config_t endpoint_config = {
         .endpoint = HA_ENDPOINT,
         .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
-        .app_device_id = ESP_ZB_HA_ON_OFF_SWITCH_DEVICE_ID, // Use On/Off Switch device ID
+        .app_device_id = ESP_ZB_HA_ON_OFF_SWITCH_DEVICE_ID,
         .app_device_version = 0
     };
     esp_zb_ep_list_add_ep(ep_list, cluster_list, endpoint_config);
@@ -413,7 +419,7 @@ static void reset_button_task(void *pvParameters) {
             }
             
             // Short press detected
-            if (!reset_triggered && hold_count > 50) { // Debounce
+            if (!reset_triggered && hold_count > 50) { 
                 g_learning_mode = !g_learning_mode;
                 if (g_learning_mode) {
                     ESP_LOGI(TAG, "Learning Mode: ENABLED");
@@ -427,55 +433,28 @@ static void reset_button_task(void *pvParameters) {
 }
 
 static void ir_test_task(void *arg) {
-    // Default fallback pulse (Keep this for before any command is learned)
-    rmt_symbol_word_t default_items[2] = {0};
-    default_items[0].level0 = 1; default_items[0].duration0 = 500;
-    default_items[0].level1 = 0; default_items[0].duration1 = 500;
-    default_items[1].level0 = 1; default_items[1].duration0 = 500;
-    default_items[1].level1 = 0; default_items[1].duration1 = 0; // trailing mark
+    ESP_LOGI(TAG, "IR TX Task waiting for first command to be learned...");
+    
+    // Block indefinitely until the RX task signals us
+    xSemaphoreTake(g_ir_learned_sem, portMAX_DELAY);
 
-    rmt_transmit_config_t default_cfg = { .loop_count = 0 };
+    char cmd_to_send[256] = {0};
 
-    char cmd_to_send[256];
+    // Safely copy the newly learned command
+    if (g_cmd_mutex) {
+        xSemaphoreTake(g_cmd_mutex, portMAX_DELAY);
+        strncpy(cmd_to_send, g_latest_ir_cmd, sizeof(cmd_to_send) - 1);
+        cmd_to_send[sizeof(cmd_to_send) - 1] = '\0';
+        xSemaphoreGive(g_cmd_mutex);
+    }
+
+    ESP_LOGI(TAG, "IR TX Task starting 1-second pulse loop...");
 
     while (1) {
-        bool has_learned = false;
-        cmd_to_send[0] = '\0';
-
-        // Prefer locally learned command
-        if (g_cmd_mutex) {
-            xSemaphoreTake(g_cmd_mutex, portMAX_DELAY);
-            if (strlen(g_latest_ir_cmd) > 0) {
-                strncpy(cmd_to_send, g_latest_ir_cmd, sizeof(cmd_to_send) - 1);
-                cmd_to_send[sizeof(cmd_to_send) - 1] = '\0';
-                has_learned = true;
-            }
-            xSemaphoreGive(g_cmd_mutex);
-        }
-
-        // Fallback to last Zigbee-written command (ir_data_buffer)
-        if (!has_learned) {
-            esp_zb_lock_acquire(portMAX_DELAY);
-            uint8_t zb_len = ir_data_buffer[0];
-            if (zb_len > 0) {
-                size_t copy_len = (zb_len < sizeof(cmd_to_send) - 1) ? zb_len : (sizeof(cmd_to_send) - 1);
-                memcpy(cmd_to_send, ir_data_buffer + 1, copy_len);
-                cmd_to_send[copy_len] = '\0';
-                has_learned = true;
-            }
-            esp_zb_lock_release();
-        }
-
-        if (has_learned) {
-            ESP_LOGI(TAG, "Test Task: Replaying learned command");
+        if (strlen(cmd_to_send) > 0) {
             transmit_ir_string(cmd_to_send);
-        } else {
-            ESP_LOGI(TAG, "Test Task: No learned command yet, sending default pulse");
-            rmt_transmit(tx_channel, copy_encoder, default_items, sizeof(default_items), &default_cfg);
-            rmt_tx_wait_all_done(tx_channel, -1); // Good practice to wait here too
         }
-
-        vTaskDelay(pdMS_TO_TICKS(5000)); // Run once every 5 seconds
+        vTaskDelay(pdMS_TO_TICKS(1000)); // 1-second pulse interval
     }
 }
 
@@ -486,9 +465,13 @@ void app_main(void) {
     };
     ESP_ERROR_CHECK(esp_zb_platform_config(&config));
 
+    // Initialize synchronization primitives
     g_cmd_mutex = xSemaphoreCreateMutex();
-    if (g_cmd_mutex == NULL) {
-        ESP_LOGE(TAG, "Failed to create Mutex!");
+    g_tx_mutex = xSemaphoreCreateMutex();
+    g_ir_learned_sem = xSemaphoreCreateBinary();
+
+    if (g_cmd_mutex == NULL || g_tx_mutex == NULL || g_ir_learned_sem == NULL) {
+        ESP_LOGE(TAG, "Failed to create Semaphores/Mutexes!");
         return;
     }
 
