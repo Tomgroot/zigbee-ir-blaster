@@ -5,276 +5,260 @@
 #include <stdlib.h>
 #include "esp_log.h"
 #include "driver/gpio.h"
-#include "driver/rmt_tx.h"
-#include "driver/rmt_rx.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/queue.h"
 #include "esp_zigbee_core.h"
 #include "esp_zigbee_cluster.h"
 #include "zcl/esp_zigbee_zcl_basic.h"
 #include "zcl/esp_zigbee_zcl_on_off.h"
 #include "zcl/esp_zigbee_zcl_common.h"
 #include "nwk/esp_zigbee_nwk.h"
-#include "freertos/semphr.h"
+#include "ir_driver.h"
 
-// Hardware Config
-#define IR_TX_GPIO              GPIO_NUM_10
-#define IR_RX_GPIO              GPIO_NUM_11
 #define BOOT_BUTTON_PIN         GPIO_NUM_9
 #define BUTTON_HOLD_TIME_MS     3000
 
-// RMT Config
-#define RMT_RESOLUTION_HZ       1000000 // 1MHz, 1 tick = 1us
-#define RMT_RX_BUFFER_SIZE      2048    // High for long codes
-#define RMT_TX_CARRIER_FREQ_HZ  38000   // 38kHz
-
-// Zigbee Config
 #define HA_ENDPOINT             1
 #define ESP_MANUFACTURER_NAME   "ZigbeeHive"
 #define ESP_MODEL_IDENTIFIER    "IR Blaster"
 
-// Custom Attribute for IR Data (String)
-#define ESP_ZB_ZCL_ATTR_IR_DATA_ID 0xFF00
+#define ESP_ZB_ZCL_CLUSTER_ID_IR_BLASTER 0xFF00
+
+#define ESP_ZB_ZCL_ATTR_IR_SEND_ID    0x0001 // CSV string (chunked)
+#define ESP_ZB_ZCL_ATTR_IR_LEARN_ID   0x0002
+#define ESP_ZB_ZCL_ATTR_IR_RESULT_ID  0x0003 // Learned code CSV (chunked reports)
 
 static const char *TAG = "IR_BLASTER";
 
-// Global Handles
-static rmt_channel_handle_t rx_channel = NULL;
-static rmt_channel_handle_t tx_channel = NULL;
-static rmt_encoder_handle_t copy_encoder = NULL;
+// ZCL attribute buffers (first byte = ZCL string length)
+static uint8_t ir_send_buffer[256]   = {0};
+static uint8_t ir_result_buffer[256] = {0};
+static bool    ir_learn_mode         = false;
 
-// Buffer for IR Data Attribute
-static char ir_data_buffer[256] = {0};
-static bool g_learning_mode = false;
+static TaskHandle_t rx_task_handle = NULL;
 
-static char g_latest_ir_cmd[256] = {0};
+#define IR_RECV_BUF_SIZE 4096
+static char ir_recv_buf[IR_RECV_BUF_SIZE];
+static int  ir_recv_total_chunks = 0;
 
-// Synchronization & Thread Safety
-static SemaphoreHandle_t g_cmd_mutex = NULL;
-static SemaphoreHandle_t g_tx_mutex = NULL;       // Protects RMT TX driver
-static SemaphoreHandle_t g_ir_learned_sem = NULL; // Signals when 1st command is learned
+#define REPORT_CHUNK_SIZE 60
 
-// --- IR RMT Functions ---
+static void report_learned_code(const char *csv) {
+    size_t total_len = strlen(csv);
+    if (total_len == 0) return;
 
-static void init_ir_tx() {
-    ESP_LOGI(TAG, "Initializing IR TX on GPIO %d", IR_TX_GPIO);
-    rmt_tx_channel_config_t tx_chan_config = {
-        .clk_src = RMT_CLK_SRC_DEFAULT,
-        .gpio_num = IR_TX_GPIO,
-        .mem_block_symbols = 64,
-        .resolution_hz = RMT_RESOLUTION_HZ,
-        .trans_queue_depth = 4,
-    };
-    ESP_LOGI(TAG, "Configuring RMT TX Channel...");
-    ESP_ERROR_CHECK(rmt_new_tx_channel(&tx_chan_config, &tx_channel));
+    int total = (int)((total_len + REPORT_CHUNK_SIZE - 1) / REPORT_CHUNK_SIZE);
 
-    rmt_carrier_config_t carrier_config = {
-        .duty_cycle = 0.33,
-        .frequency_hz = RMT_TX_CARRIER_FREQ_HZ,
-    };
-    ESP_ERROR_CHECK(rmt_apply_carrier(tx_channel, &carrier_config));
+    for (int i = 0; i < total; i++) {
+        char chunk_str[256];
+        int prefix_len = snprintf(chunk_str, sizeof(chunk_str), "%d/%d:", i, total);
+        int offset     = i * REPORT_CHUNK_SIZE;
+        int data_len   = (int)total_len - offset;
+        if (data_len > REPORT_CHUNK_SIZE) data_len = REPORT_CHUNK_SIZE;
 
-    rmt_copy_encoder_config_t encoder_config = {};
-    ESP_ERROR_CHECK(rmt_new_copy_encoder(&encoder_config, &copy_encoder));
+        int str_len = prefix_len + data_len;
+        if (str_len > 253) str_len = 253; // ZCL CharString max payload
+        memcpy(chunk_str + prefix_len, csv + offset, str_len - prefix_len);
+        chunk_str[str_len] = '\0';
 
-    ESP_ERROR_CHECK(rmt_enable(tx_channel));
-}
+        // Pack into ZCL string (length-prefixed)
+        uint8_t zcl_str[256] = {0};
+        zcl_str[0] = (uint8_t)str_len;
+        memcpy(zcl_str + 1, chunk_str, str_len);
 
-static void init_ir_rx() {
-    ESP_LOGI(TAG, "Initializing IR RX on GPIO %d", IR_RX_GPIO);
-    rmt_rx_channel_config_t rx_chan_config = {
-        .clk_src = RMT_CLK_SRC_DEFAULT,
-        .gpio_num = IR_RX_GPIO,
-        .mem_block_symbols = 64,
-        .resolution_hz = RMT_RESOLUTION_HZ,
-    };
-    ESP_LOGI(TAG, "Configuring RMT RX Channel...");
-    ESP_ERROR_CHECK(rmt_new_rx_channel(&rx_chan_config, &rx_channel));
+        esp_zb_lock_acquire(portMAX_DELAY);
 
-    ESP_ERROR_CHECK(rmt_enable(rx_channel));
-}
+        esp_zb_zcl_set_attribute_val(HA_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_IR_BLASTER,
+            ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_IR_RESULT_ID, zcl_str, false);
 
-// Simple RLE parsing: "100,-100,200,-200" -> RMT symbols
-static esp_err_t transmit_ir_string(const char* data) {
-    if (!data || data[0] == '\0') {
-        return ESP_FAIL;
+        esp_zb_zcl_report_attr_cmd_t cmd;
+        memset(&cmd, 0, sizeof(cmd));
+        cmd.zcl_basic_cmd.src_endpoint          = HA_ENDPOINT;
+        cmd.zcl_basic_cmd.dst_endpoint          = 1;
+        cmd.zcl_basic_cmd.dst_addr_u.addr_short = 0x0000;
+        cmd.address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT;
+        cmd.clusterID    = ESP_ZB_ZCL_CLUSTER_ID_IR_BLASTER;
+        cmd.direction    = ESP_ZB_ZCL_CMD_DIRECTION_TO_CLI;
+        cmd.attributeID  = ESP_ZB_ZCL_ATTR_IR_RESULT_ID;
+
+        esp_err_t ret = esp_zb_zcl_report_attr_cmd_req(&cmd);
+        ESP_LOGI(TAG, "Result chunk %d/%d: %s (0x%x)", i, total, esp_err_to_name(ret), ret);
+
+        esp_zb_lock_release();
+
+        vTaskDelay(pdMS_TO_TICKS(150)); // gap between chunks
     }
-
-    // Parse tokens into a temporary int buffer
-    int32_t durations[256] = {0};
-    int token_count = 0;
-
-    char *datacpy = strdup(data);
-    if (!datacpy) {
-        return ESP_ERR_NO_MEM;
-    }
-    char *saveptr = NULL;
-    char *token = strtok_r(datacpy, ",", &saveptr);
-    while (token && token_count < (int)(sizeof(durations) / sizeof(durations[0]))) {
-        durations[token_count++] = (int32_t)strtol(token, NULL, 10);
-        token = strtok_r(NULL, ",", &saveptr);
-    }
-    free(datacpy);
-
-    if (token_count == 0) {
-        return ESP_FAIL;
-    }
-
-    // Pair tokens into RMT symbols (two durations per symbol)
-    size_t symbol_count = (token_count + 1) / 2; // round up
-    rmt_symbol_word_t *items = calloc(symbol_count, sizeof(rmt_symbol_word_t));
-    if (!items) {
-        return ESP_ERR_NO_MEM;
-    }
-
-    for (size_t i = 0; i < symbol_count; i++) {
-        int32_t first = durations[i * 2];
-        int32_t second = (i * 2 + 1 < token_count) ? durations[i * 2 + 1] : 0;
-
-        items[i].level0 = (first >= 0) ? 1 : 0;
-        items[i].duration0 = (uint32_t)abs(first);
-        items[i].level1 = (second >= 0) ? 1 : 0;
-        items[i].duration1 = (uint32_t)abs(second);
-    }
-
-    rmt_transmit_config_t transmit_config = {
-        .loop_count = 0,
-    };
-
-    esp_err_t err = ESP_OK;
-
-    // Mutex to prevent concurrent transmissions crashing the RMT driver
-    if (g_tx_mutex) xSemaphoreTake(g_tx_mutex, portMAX_DELAY);
-
-    ESP_LOGI(TAG, "Transmitting IR (%d symbols)...", (int)symbol_count);
-    err = rmt_transmit(tx_channel, copy_encoder, items, symbol_count * sizeof(rmt_symbol_word_t), &transmit_config);
-    if (err == ESP_OK) {
-        err = rmt_tx_wait_all_done(tx_channel, -1);
-    }
-
-    if (g_tx_mutex) xSemaphoreGive(g_tx_mutex);
-
-    free(items);
-    return err;
-}
-
-static QueueHandle_t rx_queue = NULL;
-
-static bool rx_done_callback(rmt_channel_handle_t rx_chan, const rmt_rx_done_event_data_t *edata, void *user_data) {
-    BaseType_t high_task_wakeup = pdFALSE;
-    xQueueSendFromISR(rx_queue, edata, &high_task_wakeup);
-    return high_task_wakeup == pdTRUE;
 }
 
 static void real_ir_rx_task(void *pvParameters) {
-    rx_queue = xQueueCreate(1, sizeof(rmt_rx_done_event_data_t));
-    
-    rmt_rx_event_callbacks_t cbs = {
-        .on_recv_done = rx_done_callback,
-    };
-    rmt_rx_register_event_callbacks(rx_channel, &cbs, NULL);
-    
-    rmt_symbol_word_t *buffer = malloc(RMT_RX_BUFFER_SIZE * sizeof(rmt_symbol_word_t));
-    
-    // Accept a wide but sane pulse range for IR (0.4us - 12ms)
-    rmt_receive_config_t rx_config = {
-        .signal_range_min_ns = 400,
-        .signal_range_max_ns = 12000000,
-    };
+    ir_driver_start_learning();
 
-    while(1) {
-        rmt_receive(rx_channel, buffer, RMT_RX_BUFFER_SIZE * sizeof(rmt_symbol_word_t), &rx_config);
-        
-        rmt_rx_done_event_data_t event_data;
-        if (xQueueReceive(rx_queue, &event_data, portMAX_DELAY)) {
-            // Process Data
-            ESP_LOGI(TAG, "IR Received! %d symbols", event_data.num_symbols);
-            
-            // Encode to String using local buffer
-            char local_buffer[256];
-            int len = 0;
-            local_buffer[0] = '\0';
-            
-            for(size_t i=0; i<event_data.num_symbols; i++) {
-                // Each RMT symbol holds two durations; flatten both
-                int vals[2];
-                vals[0] = (buffer[i].level0 == 0) ? (int)buffer[i].duration0 : -((int)buffer[i].duration0);
-                vals[1] = (buffer[i].level1 == 0) ? (int)buffer[i].duration1 : -((int)buffer[i].duration1);
+    // Use a heap buffer — CSV can be several KB for a full IR signal
+    char *decoded = malloc(IR_RECV_BUF_SIZE);
+    if (!decoded) {
+        ESP_LOGE(TAG, "OOM for decode buffer");
+        rx_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
 
-                for (int j = 0; j < 2; j++) {
-                    if (vals[j] == 0) continue; 
-                    if (len >= (int)sizeof(local_buffer) - 20) break;
-                    
-                    int written = snprintf(local_buffer + len, sizeof(local_buffer) - len, "%s%d", (len == 0 ? "" : ","), vals[j]);
-                    if (written > 0) len += written;
-                }
-            }
-            
-            if (len == 0) {
-                rmt_symbol_word_t *sym = buffer;
-                ESP_LOGW(TAG, "IR capture was empty, ignoring (symbols=%d)", event_data.num_symbols);
-                continue; // Wait for a valid signal
-            }
-
-            ESP_LOGI(TAG, "\n\n*** LEARNED COMMAND ***\n%s\n***********************\n", local_buffer);
-
-            if (g_cmd_mutex) {
-                xSemaphoreTake(g_cmd_mutex, portMAX_DELAY);
-                strncpy(g_latest_ir_cmd, local_buffer, sizeof(g_latest_ir_cmd) - 1);
-                g_latest_ir_cmd[sizeof(g_latest_ir_cmd) - 1] = '\0';
-                xSemaphoreGive(g_cmd_mutex);
-            }
-
-            // Update Zigbee Attribute
-            esp_zb_lock_acquire(portMAX_DELAY);
-            esp_zb_zcl_set_attribute_val(
-                HA_ENDPOINT,
-                ESP_ZB_ZCL_CLUSTER_ID_ON_OFF,
-                ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-                ESP_ZB_ZCL_ATTR_IR_DATA_ID,
-                local_buffer,
-                false
-            );
-            esp_zb_lock_release();
-
-            // Notify the TX task that a command is learned
-            if (g_ir_learned_sem) {
-                xSemaphoreGive(g_ir_learned_sem);
-            }
-
-            // Shut down RX to prevent it from running alongside TX
-            ESP_LOGI(TAG, "First IR command learned. Stopping RX and exiting listen task.");
-            rmt_disable(rx_channel);
-            free(buffer);
-            vQueueDelete(rx_queue);
-            vTaskDelete(NULL); // Terminate this task completely
+    while (1) {
+        if (!ir_driver_poll_decode(decoded, IR_RECV_BUF_SIZE)) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
         }
+
+        if (decoded[0] == '\0') {
+            ESP_LOGW(TAG, "IR capture was empty, ignoring.");
+            ir_driver_start_learning();
+            free(decoded);
+            decoded = malloc(IR_RECV_BUF_SIZE);
+            if (!decoded) { rx_task_handle = NULL; vTaskDelete(NULL); return; }
+            continue;
+        }
+
+        ESP_LOGI(TAG, "*** LEARNED: %d chars ***", (int)strlen(decoded));
+
+        ir_driver_stop_learning();
+        report_learned_code(decoded);
+        free(decoded);
+
+        // Turn off learn mode AFTER all result chunks are delivered
+        esp_zb_lock_acquire(portMAX_DELAY);
+        ir_learn_mode = false;
+        esp_zb_zcl_set_attribute_val(HA_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_IR_BLASTER,
+            ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_IR_LEARN_ID, &ir_learn_mode, false);
+
+        esp_zb_zcl_report_attr_cmd_t cmd;
+        memset(&cmd, 0, sizeof(cmd));
+        cmd.zcl_basic_cmd.src_endpoint          = HA_ENDPOINT;
+        cmd.zcl_basic_cmd.dst_endpoint          = 1;
+        cmd.zcl_basic_cmd.dst_addr_u.addr_short = 0x0000;
+        cmd.address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT;
+        cmd.clusterID    = ESP_ZB_ZCL_CLUSTER_ID_IR_BLASTER;
+        cmd.direction    = ESP_ZB_ZCL_CMD_DIRECTION_TO_CLI;
+        cmd.attributeID  = ESP_ZB_ZCL_ATTR_IR_LEARN_ID;
+        esp_zb_zcl_report_attr_cmd_req(&cmd);
+        esp_zb_lock_release();
+
+        ESP_LOGI(TAG, "Learn complete. Exiting RX task.");
+        rx_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
     }
 }
 
-// --- Zigbee Functions ---
+static void transmit_accumulated(void) {
+    int32_t *durations = malloc(512 * sizeof(int32_t));
+    if (!durations) { ESP_LOGE(TAG, "OOM for durations"); return; }
+    int count = 0;
+    char *cpy = strdup(ir_recv_buf);
+    if (!cpy) { free(durations); return; }
+    char *sp = NULL;
+    for (char *tok = strtok_r(cpy, ",", &sp); tok && count < 512;
+         tok = strtok_r(NULL, ",", &sp)) {
+        durations[count++] = (int32_t)strtol(tok, NULL, 10);
+    }
+    free(cpy);
+    if (count > 0) ir_driver_send_raw(durations, count);
+    free(durations);
+}
 
 static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t *message) {
     if (!message) return ESP_FAIL;
-    
-    if (message->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF && 
-        message->attribute.id == ESP_ZB_ZCL_ATTR_IR_DATA_ID) {
-        
-        ESP_LOGI(TAG, "IR Data Attribute Written!");
-        
-        uint8_t *zcl_string = (uint8_t*)message->attribute.data.value;
-        if (zcl_string) {
-            uint8_t len = ir_data_buffer[0];
-            if (len > 0) {
-                char temp[256];
-                memcpy(temp, ir_data_buffer + 1, len);
-                temp[len] = '\0';
-                ESP_LOGI(TAG, "Transmitting via Zigbee Trigger: %s", temp);
-                transmit_ir_string(temp);
+    ESP_LOGI(TAG, "zb_attribute_handler: cluster=0x%04x attr=0x%04x",
+             message->info.cluster, message->attribute.id);
+
+    if (message->info.cluster != ESP_ZB_ZCL_CLUSTER_ID_IR_BLASTER) return ESP_OK;
+
+    if (message->attribute.id == ESP_ZB_ZCL_ATTR_IR_SEND_ID) {
+        uint8_t *zcl_string = (uint8_t *)message->attribute.data.value;
+        if (!zcl_string || zcl_string[0] == 0) return ESP_OK;
+
+        uint8_t len = zcl_string[0];
+        char temp[256];
+        memcpy(temp, zcl_string + 1, len);
+        temp[len] = '\0';
+
+        char *slash = strchr(temp, '/');
+        char *colon = slash ? strchr(slash + 1, ':') : NULL;
+
+        if (!slash || !colon) {
+            // No chunk prefix: send directly (manual paste from HA)
+            strncpy(ir_recv_buf, temp, IR_RECV_BUF_SIZE - 1);
+            ir_recv_buf[IR_RECV_BUF_SIZE - 1] = '\0';
+            transmit_accumulated();
+            ir_send_buffer[0] = 0;
+            esp_zb_zcl_set_attribute_val(HA_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_IR_BLASTER,
+                ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_IR_SEND_ID, ir_send_buffer, false);
+            esp_zb_zcl_report_attr_cmd_t send_clear_cmd = {0};
+            send_clear_cmd.zcl_basic_cmd.src_endpoint          = HA_ENDPOINT;
+            send_clear_cmd.zcl_basic_cmd.dst_endpoint          = 1;
+            send_clear_cmd.zcl_basic_cmd.dst_addr_u.addr_short = 0x0000;
+            send_clear_cmd.address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT;
+            send_clear_cmd.clusterID    = ESP_ZB_ZCL_CLUSTER_ID_IR_BLASTER;
+            send_clear_cmd.direction    = ESP_ZB_ZCL_CMD_DIRECTION_TO_CLI;
+            send_clear_cmd.attributeID  = ESP_ZB_ZCL_ATTR_IR_SEND_ID;
+            esp_zb_zcl_report_attr_cmd_req(&send_clear_cmd);
+            return ESP_OK;
+        }
+
+        int n = atoi(temp);
+        int t = atoi(slash + 1);
+        char *data = colon + 1;
+        size_t data_len = strlen(data);
+
+        if (n == 0) {
+            strncpy(ir_recv_buf, data, IR_RECV_BUF_SIZE - 1);
+            ir_recv_buf[IR_RECV_BUF_SIZE - 1] = '\0';
+            ir_recv_total_chunks = t;
+        } else {
+            size_t cur = strlen(ir_recv_buf);
+            if (cur + 1 + data_len < IR_RECV_BUF_SIZE) {
+                ir_recv_buf[cur] = ',';
+                memcpy(ir_recv_buf + cur + 1, data, data_len);
+                ir_recv_buf[cur + 1 + data_len] = '\0';
             }
         }
+
+        if (n + 1 != t) {
+            ESP_LOGI(TAG, "Chunk %d/%d received", n + 1, t);
+            return ESP_OK;
+        }
+
+        ESP_LOGI(TAG, "All %d chunks received (%d chars). Transmitting...", t, (int)strlen(ir_recv_buf));
+        transmit_accumulated();
+        ir_send_buffer[0] = 0;
+        esp_zb_zcl_set_attribute_val(HA_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_IR_BLASTER,
+            ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_IR_SEND_ID, ir_send_buffer, false);
+        esp_zb_zcl_report_attr_cmd_t send_clear_cmd = {0};
+        send_clear_cmd.zcl_basic_cmd.src_endpoint          = HA_ENDPOINT;
+        send_clear_cmd.zcl_basic_cmd.dst_endpoint          = 1;
+        send_clear_cmd.zcl_basic_cmd.dst_addr_u.addr_short = 0x0000;
+        send_clear_cmd.address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT;
+        send_clear_cmd.clusterID    = ESP_ZB_ZCL_CLUSTER_ID_IR_BLASTER;
+        send_clear_cmd.direction    = ESP_ZB_ZCL_CMD_DIRECTION_TO_CLI;
+        send_clear_cmd.attributeID  = ESP_ZB_ZCL_ATTR_IR_SEND_ID;
+        esp_zb_zcl_report_attr_cmd_req(&send_clear_cmd);
+        return ESP_OK;
     }
+
+    if (message->attribute.id == ESP_ZB_ZCL_ATTR_IR_LEARN_ID) {
+        bool learn_requested = *(bool *)message->attribute.data.value;
+        ESP_LOGI(TAG, "IR Learn Mode toggled to: %d", learn_requested);
+
+        if (learn_requested && rx_task_handle == NULL) {
+            ir_learn_mode = true;
+            xTaskCreate(real_ir_rx_task, "ir_rx", 8192, NULL, 10, &rx_task_handle);
+        } else if (!learn_requested && rx_task_handle != NULL) {
+            ir_learn_mode = false;
+            ir_driver_stop_learning();
+            vTaskDelete(rx_task_handle);
+            rx_task_handle = NULL;
+            ESP_LOGI(TAG, "IR Learn Mode aborted manually.");
+        }
+    }
+
     return ESP_OK;
 }
 
@@ -319,11 +303,11 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
             ESP_LOGI(TAG, "Joined Network!");
         } else {
             ESP_LOGW(TAG, "Steering Failed, retrying...");
-            esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_top_level_commissioning_cb, ESP_ZB_BDB_MODE_NETWORK_STEERING, 1000);
+            esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_top_level_commissioning_cb,
+                                   ESP_ZB_BDB_MODE_NETWORK_STEERING, 1000);
         }
         break;
     default:
-        ESP_LOGI(TAG, "ZDO Signal: 0x%x", sig_type);
         break;
     }
 }
@@ -338,43 +322,38 @@ static void esp_zb_task(void *pvParameters) {
         },
     };
     esp_zb_init(&zb_nwk_cfg);
-    
-    // Create Attribute List for On/Off Cluster
+
+    esp_zb_cluster_list_t *cluster_list = esp_zb_zcl_cluster_list_create();
+
+    // On/Off Cluster (keeps standard Zigbee networks happy)
     esp_zb_attribute_list_t *on_off_attr_list = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_ON_OFF);
-    
-    // Standard On/Off Attribute
     bool on_off_value = false;
     esp_zb_on_off_cluster_add_attr(on_off_attr_list, ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID, &on_off_value);
-    
-    // Initialize buffer with length 0
-    ir_data_buffer[0] = 0; 
-    
-    esp_zb_cluster_add_attr(
-        on_off_attr_list,
-        ESP_ZB_ZCL_CLUSTER_ID_ON_OFF,
-        ESP_ZB_ZCL_ATTR_IR_DATA_ID,
-        ESP_ZB_ZCL_ATTR_TYPE_CHAR_STRING,
-        ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING,
-        ir_data_buffer
-    );
-
-    // Create Cluster List
-    esp_zb_cluster_list_t *cluster_list = esp_zb_zcl_cluster_list_create();
     esp_zb_cluster_list_add_on_off_cluster(cluster_list, on_off_attr_list, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
-    
-    // Basic Cluster
+
+    ir_send_buffer[0]   = 254;
+    ir_result_buffer[0] = 254;
+    ir_learn_mode       = false;
+
+    esp_zb_attribute_list_t *ir_attr_list = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_IR_BLASTER);
+    esp_zb_cluster_add_attr(ir_attr_list, ESP_ZB_ZCL_CLUSTER_ID_IR_BLASTER, ESP_ZB_ZCL_ATTR_IR_SEND_ID,
+        ESP_ZB_ZCL_ATTR_TYPE_CHAR_STRING, ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING, ir_send_buffer);
+    esp_zb_cluster_add_attr(ir_attr_list, ESP_ZB_ZCL_CLUSTER_ID_IR_BLASTER, ESP_ZB_ZCL_ATTR_IR_LEARN_ID,
+        ESP_ZB_ZCL_ATTR_TYPE_BOOL, ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING, &ir_learn_mode);
+    esp_zb_cluster_add_attr(ir_attr_list, ESP_ZB_ZCL_CLUSTER_ID_IR_BLASTER, ESP_ZB_ZCL_ATTR_IR_RESULT_ID,
+        ESP_ZB_ZCL_ATTR_TYPE_CHAR_STRING, ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING, ir_result_buffer);
+    esp_zb_cluster_list_add_custom_cluster(cluster_list, ir_attr_list, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+
     esp_zb_basic_cluster_cfg_t basic_cfg = { .zcl_version = 0x02, .power_source = ESP_ZB_ZCL_BASIC_POWER_SOURCE_MAINS_SINGLE_PHASE };
     esp_zb_attribute_list_t *basic_attr_list = esp_zb_basic_cluster_create(&basic_cfg);
     esp_zb_basic_cluster_add_attr(basic_attr_list, ESP_ZB_ZCL_ATTR_BASIC_MANUFACTURER_NAME_ID, (void *)"\x0A" ESP_MANUFACTURER_NAME);
-    esp_zb_basic_cluster_add_attr(basic_attr_list, ESP_ZB_ZCL_ATTR_BASIC_MODEL_IDENTIFIER_ID, (void *)"\x0D" ESP_MODEL_IDENTIFIER);
+    esp_zb_basic_cluster_add_attr(basic_attr_list, ESP_ZB_ZCL_ATTR_BASIC_MODEL_IDENTIFIER_ID, (void *)"\x0A" ESP_MODEL_IDENTIFIER);
     esp_zb_cluster_list_add_basic_cluster(cluster_list, basic_attr_list, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 
-    // Identify Cluster
     esp_zb_identify_cluster_cfg_t identify_cfg = { .identify_time = 0 };
     esp_zb_attribute_list_t *identify_attr_list = esp_zb_identify_cluster_create(&identify_cfg);
     esp_zb_cluster_list_add_identify_cluster(cluster_list, identify_attr_list, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 
-    // Endpoint
     esp_zb_ep_list_t *ep_list = esp_zb_ep_list_create();
     esp_zb_endpoint_config_t endpoint_config = {
         .endpoint = HA_ENDPOINT,
@@ -385,11 +364,9 @@ static void esp_zb_task(void *pvParameters) {
     esp_zb_ep_list_add_ep(ep_list, cluster_list, endpoint_config);
 
     esp_zb_device_register(ep_list);
-    
-    // Register Action Handler for Attribute Writes
     esp_zb_core_action_handler_register(zb_action_handler);
 
-    esp_zb_start(false); 
+    esp_zb_start(false);
     esp_zb_stack_main_loop();
 }
 
@@ -406,55 +383,17 @@ static void reset_button_task(void *pvParameters) {
     while (1) {
         if (gpio_get_level(BOOT_BUTTON_PIN) == 0) {
             int hold_count = 0;
-            bool reset_triggered = false;
             while (gpio_get_level(BOOT_BUTTON_PIN) == 0) {
                 vTaskDelay(pdMS_TO_TICKS(100));
                 hold_count += 100;
                 if (hold_count >= BUTTON_HOLD_TIME_MS) {
                     ESP_LOGW(TAG, "Factory Reset...");
-                    esp_zb_factory_reset(); 
-                    reset_triggered = true;
+                    esp_zb_factory_reset();
                     break;
                 }
             }
-            
-            // Short press detected
-            if (!reset_triggered && hold_count > 50) { 
-                g_learning_mode = !g_learning_mode;
-                if (g_learning_mode) {
-                    ESP_LOGI(TAG, "Learning Mode: ENABLED");
-                } else {
-                    ESP_LOGI(TAG, "Learning Mode: DISABLED");
-                }
-            }
         }
-        vTaskDelay(pdMS_TO_TICKS(100)); 
-    }
-}
-
-static void ir_test_task(void *arg) {
-    ESP_LOGI(TAG, "IR TX Task waiting for first command to be learned...");
-    
-    // Block indefinitely until the RX task signals us
-    xSemaphoreTake(g_ir_learned_sem, portMAX_DELAY);
-
-    char cmd_to_send[256] = {0};
-
-    // Safely copy the newly learned command
-    if (g_cmd_mutex) {
-        xSemaphoreTake(g_cmd_mutex, portMAX_DELAY);
-        strncpy(cmd_to_send, g_latest_ir_cmd, sizeof(cmd_to_send) - 1);
-        cmd_to_send[sizeof(cmd_to_send) - 1] = '\0';
-        xSemaphoreGive(g_cmd_mutex);
-    }
-
-    ESP_LOGI(TAG, "IR TX Task starting 1-second pulse loop...");
-
-    while (1) {
-        if (strlen(cmd_to_send) > 0) {
-            transmit_ir_string(cmd_to_send);
-        }
-        vTaskDelay(pdMS_TO_TICKS(1000)); // 1-second pulse interval
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
@@ -465,23 +404,8 @@ void app_main(void) {
     };
     ESP_ERROR_CHECK(esp_zb_platform_config(&config));
 
-    // Initialize synchronization primitives
-    g_cmd_mutex = xSemaphoreCreateMutex();
-    g_tx_mutex = xSemaphoreCreateMutex();
-    g_ir_learned_sem = xSemaphoreCreateBinary();
+    ir_driver_init();
 
-    if (g_cmd_mutex == NULL || g_tx_mutex == NULL || g_ir_learned_sem == NULL) {
-        ESP_LOGE(TAG, "Failed to create Semaphores/Mutexes!");
-        return;
-    }
-
-    // Init IR
-    init_ir_tx();
-    init_ir_rx();
-
-    // Start Tasks
     xTaskCreate(reset_button_task, "reset_button", 2048, NULL, 10, NULL);
-    xTaskCreate(real_ir_rx_task, "ir_rx", 4096, NULL, 10, NULL);
     xTaskCreate(esp_zb_task, "Zigbee_main", 4096, NULL, 5, NULL);
-    xTaskCreate(ir_test_task, "ir_test", 4096, NULL, 10, NULL);
 }
